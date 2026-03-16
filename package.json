@@ -4,5 +4,8 @@
   "type": "module",
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.99.1"
   }
 }

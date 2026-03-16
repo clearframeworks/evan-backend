@@ -1,3 +1,5 @@
+import { supabaseAdmin } from '../lib/supabase.js';
+
 export default async function handler(req, res) {
   setCors(res);
 
@@ -26,9 +28,9 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'Missing message' });
     }
 
-    const activeProfile = getOrCreateProfile(sessionId, browserMemory);
-    const relevantMemory = getRelevantMemory(sessionId, userMessage);
-    const recentTurns = getRecentTurns(sessionId);
+    const activeProfile = await getOrCreateProfile(sessionId, browserMemory);
+    const relevantMemory = await getRelevantMemory(sessionId, userMessage);
+    const recentTurns = await getRecentTurns(sessionId);
 
     const systemPrompt = buildSystemPrompt({
       activeProfile,
@@ -88,17 +90,20 @@ export default async function handler(req, res) {
 
     const parsed = parseEvanPacket(outputText);
 
-    saveTurn(sessionId, 'user', userMessage);
-    saveTurn(sessionId, 'evan', parsed.reply);
-    updateProfile(sessionId, parsed, browserMemory);
-    updateMemoryStore(sessionId, parsed, userMessage, activeProfile);
+    await saveConversationTurn(sessionId, 'user', userMessage);
+    await saveConversationTurn(sessionId, 'evan', parsed.reply);
+    await updateProfileFromReply(sessionId, parsed, browserMemory);
+    await saveMemoryEntries(sessionId, parsed, userMessage);
 
-    const updatedProfile = getOrCreateProfile(sessionId, browserMemory);
+    const updatedProfile = await getOrCreateProfile(sessionId, browserMemory);
+    const updatedTurns = await getRecentTurns(sessionId);
+
     const updatedMemory = buildReturnedMemory({
       browserMemory,
       activeProfile: updatedProfile,
       parsed,
-      sessionId
+      sessionId,
+      recentTurns: updatedTurns
     });
 
     return res.status(200).json({
@@ -106,9 +111,9 @@ export default async function handler(req, res) {
       memory: updatedMemory,
       session_id: sessionId,
       profile: {
-        id: updatedProfile.id,
-        displayName: updatedProfile.displayName || '',
-        role: updatedProfile.role,
+        session_id: sessionId,
+        display_name: updatedProfile.display_name || '',
+        role: updatedProfile.role || 'guest',
         context: updatedProfile.context || ''
       }
     });
@@ -123,24 +128,22 @@ export default async function handler(req, res) {
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://clearframeworks.org');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-evan-session');
 }
 
-const CREATOR_PROFILE = {
-  id: 'creator_michael',
-  name: 'Michael Travis Paynotta',
-  role: 'creator',
-  summary: 'Origin point, architectural reference, legacy context, and singularity source for EVAN.',
-  ventures: ['Clearframe', 'Proximity Landscape Design', 'Clarity', 'Elias Marrow']
-};
+function getSessionId(req, body) {
+  const headerSession = req.headers['x-evan-session'] || '';
+  const bodySession = body?.session_id || '';
+  const sessionId = String(bodySession || headerSession || '').trim();
 
-const PROFILE_STORE = globalThis.__EVAN_PROFILE_STORE__ || new Map();
-const MEMORY_STORE = globalThis.__EVAN_MEMORY_STORE__ || new Map();
-const TURN_STORE = globalThis.__EVAN_TURN_STORE__ || new Map();
+  if (sessionId) return sanitizeId(sessionId);
 
-globalThis.__EVAN_PROFILE_STORE__ = PROFILE_STORE;
-globalThis.__EVAN_MEMORY_STORE__ = MEMORY_STORE;
-globalThis.__EVAN_TURN_STORE__ = TURN_STORE;
+  return `guest_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+}
+
+function sanitizeId(value) {
+  return String(value).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+}
 
 function sanitizeBrowserMemory(memory) {
   return {
@@ -164,81 +167,61 @@ function sanitizeBrowserMemory(memory) {
   };
 }
 
-function getSessionId(req, body) {
-  const explicit = String(body?.session_id || '').trim();
-  if (explicit) return sanitizeId(explicit);
+async function getOrCreateProfile(sessionId, browserMemory) {
+  const { data: existing, error: readError } = await supabaseAdmin
+    .from('profiles')
+    .select('*')
+    .eq('session_id', sessionId)
+    .maybeSingle();
 
-  const headerId = String(req?.headers?.['x-evan-session'] || '').trim();
-  if (headerId) return sanitizeId(headerId);
+  if (readError) throw readError;
+  if (existing) return existing;
 
-  const memoryName = String(body?.memory?.profile?.name || '').trim();
-  const memoryContext = String(body?.memory?.profile?.context || '').trim();
-  const sessionSeed = JSON.stringify(body?.memory?.session || []).slice(0, 400);
-  const raw = `${memoryName}|${memoryContext}|${sessionSeed}`;
+  const starter = {
+    session_id: sessionId,
+    display_name: browserMemory?.profile?.name || null,
+    role: 'guest',
+    summary: null,
+    context: browserMemory?.profile?.context || null,
+    focus: browserMemory?.summaries?.focus || null,
+    pressure: browserMemory?.summaries?.pressure || null,
+    next_step: browserMemory?.summaries?.nextStep || null,
+    is_creator: false
+  };
 
-  if (raw.replace(/[|]/g, '').trim()) {
-    return 'guest_' + simpleHash(raw);
-  }
+  const { data: created, error: createError } = await supabaseAdmin
+    .from('profiles')
+    .insert(starter)
+    .select()
+    .single();
 
-  return 'guest_' + simpleHash(`${Date.now()}_${Math.random()}`);
+  if (createError) throw createError;
+  return created;
 }
 
-function sanitizeId(value) {
-  return String(value).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || ('guest_' + simpleHash(value));
-}
+async function getRelevantMemory(sessionId, userMessage) {
+  const { data, error } = await supabaseAdmin
+    .from('memory_entries')
+    .select('*')
+    .eq('session_id', sessionId)
+    .order('updated_at', { ascending: false })
+    .limit(20);
 
-function simpleHash(input) {
-  let hash = 0;
-  const str = String(input);
-  for (let i = 0; i < str.length; i += 1) {
-    hash = ((hash << 5) - hash) + str.charCodeAt(i);
-    hash |= 0;
-  }
-  return Math.abs(hash).toString(36);
-}
+  if (error) throw error;
 
-function getOrCreateProfile(sessionId, browserMemory) {
-  if (!PROFILE_STORE.has(sessionId)) {
-    PROFILE_STORE.set(sessionId, {
-      id: sessionId,
-      displayName: String(browserMemory?.profile?.name || '').trim(),
-      role: sessionId.startsWith('creator_') ? 'creator' : 'guest',
-      context: String(browserMemory?.profile?.context || '').trim(),
-      summary: '',
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    });
-  }
-
-  const profile = PROFILE_STORE.get(sessionId);
-
-  if (!profile.displayName && browserMemory?.profile?.name) {
-    profile.displayName = String(browserMemory.profile.name).trim();
-  }
-
-  if (browserMemory?.profile?.context) {
-    profile.context = mergeContext(profile.context, browserMemory.profile.context);
-  }
-
-  profile.updatedAt = Date.now();
-  PROFILE_STORE.set(sessionId, profile);
-  return profile;
-}
-
-function getRelevantMemory(sessionId, userMessage) {
-  const items = MEMORY_STORE.get(sessionId) || [];
   const lowered = String(userMessage || '').toLowerCase();
+  const items = data || [];
 
   return items
     .map((item) => {
       let score = Number(item.score || 0.3);
       const content = String(item.content || '').toLowerCase();
-      if (lowered && content) {
-        const tokens = lowered.split(/\W+/).filter(Boolean);
-        for (const token of tokens) {
-          if (token.length > 3 && content.includes(token)) score += 0.15;
-        }
+      const tokens = lowered.split(/\W+/).filter(Boolean);
+
+      for (const token of tokens) {
+        if (token.length > 3 && content.includes(token)) score += 0.15;
       }
+
       return { ...item, _rank: score };
     })
     .sort((a, b) => b._rank - a._rank)
@@ -246,108 +229,111 @@ function getRelevantMemory(sessionId, userMessage) {
     .map(({ _rank, ...item }) => item);
 }
 
-function getRecentTurns(sessionId) {
-  return (TURN_STORE.get(sessionId) || []).slice(-12);
+async function getRecentTurns(sessionId) {
+  const { data, error } = await supabaseAdmin
+    .from('conversation_turns')
+    .select('role, content, created_at')
+    .eq('session_id', sessionId)
+    .order('created_at', { ascending: false })
+    .limit(12);
+
+  if (error) throw error;
+
+  return (data || [])
+    .reverse()
+    .map((row) => ({
+      role: row.role,
+      text: row.content,
+      ts: row.created_at ? new Date(row.created_at).getTime() : Date.now()
+    }));
 }
 
-function saveTurn(sessionId, role, text) {
-  const turns = TURN_STORE.get(sessionId) || [];
-  turns.push({ role, text: String(text || '').slice(0, 2000), ts: Date.now() });
-  TURN_STORE.set(sessionId, turns.slice(-20));
+async function saveConversationTurn(sessionId, role, content) {
+  const { error } = await supabaseAdmin
+    .from('conversation_turns')
+    .insert({
+      session_id: sessionId,
+      role,
+      content: String(content || '').slice(0, 4000)
+    });
+
+  if (error) throw error;
 }
 
-function updateProfile(sessionId, parsed, browserMemory) {
-  const profile = PROFILE_STORE.get(sessionId) || {
-    id: sessionId,
-    displayName: '',
-    role: 'guest',
-    context: '',
-    summary: '',
-    createdAt: Date.now(),
-    updatedAt: Date.now()
+async function updateProfileFromReply(sessionId, parsed, browserMemory) {
+  const patch = {
+    display_name: parsed.name || browserMemory?.profile?.name || null,
+    context: mergeContext(browserMemory?.profile?.context || '', parsed.context || ''),
+    focus: parsed.focus || browserMemory?.summaries?.focus || null,
+    pressure: parsed.pressure || browserMemory?.summaries?.pressure || null,
+    next_step: parsed.nextStep || browserMemory?.summaries?.nextStep || null,
+    summary: compactSummary([
+      parsed.focus,
+      parsed.pressure,
+      parsed.nextStep,
+      parsed.context
+    ].filter(Boolean).join(' | '))
   };
 
-  if (parsed.name) {
-    profile.displayName = parsed.name;
-  } else if (!profile.displayName && browserMemory?.profile?.name) {
-    profile.displayName = String(browserMemory.profile.name).trim();
-  }
+  const { error } = await supabaseAdmin
+    .from('profiles')
+    .update(patch)
+    .eq('session_id', sessionId);
 
-  profile.context = mergeContext(profile.context, parsed.context || browserMemory?.profile?.context || '');
-  profile.summary = compactSummary([
-    profile.summary,
-    parsed.focus,
-    parsed.pressure,
-    parsed.nextStep
-  ].filter(Boolean).join(' | '));
-  profile.updatedAt = Date.now();
-
-  PROFILE_STORE.set(sessionId, profile);
+  if (error) throw error;
 }
 
-function updateMemoryStore(sessionId, parsed, userMessage, activeProfile) {
-  const items = MEMORY_STORE.get(sessionId) || [];
+async function saveMemoryEntries(sessionId, parsed, userMessage) {
   const candidates = [
-    {
-      kind: 'focus',
-      content: parsed.focus,
-      score: 0.9
-    },
-    {
-      kind: 'pressure',
-      content: parsed.pressure,
-      score: 0.9
-    },
-    {
-      kind: 'next_step',
-      content: parsed.nextStep,
-      score: 0.85
-    },
-    {
-      kind: 'context',
-      content: parsed.context || activeProfile?.context,
-      score: 0.7
-    },
-    {
-      kind: 'user_signal',
-      content: String(userMessage || '').slice(0, 240),
-      score: 0.4
-    }
+    { kind: 'focus', content: parsed.focus, score: 0.9 },
+    { kind: 'pressure', content: parsed.pressure, score: 0.9 },
+    { kind: 'next_step', content: parsed.nextStep, score: 0.85 },
+    { kind: 'context', content: parsed.context, score: 0.7 },
+    { kind: 'user_signal', content: String(userMessage || '').slice(0, 240), score: 0.4 }
   ].filter((item) => item.content && String(item.content).trim());
 
   for (const candidate of candidates) {
     const content = compactSummary(candidate.content);
-    const existing = items.find((item) => item.kind === candidate.kind && item.content === content);
+
+    const { data: existing } = await supabaseAdmin
+      .from('memory_entries')
+      .select('*')
+      .eq('session_id', sessionId)
+      .eq('kind', candidate.kind)
+      .eq('content', content)
+      .maybeSingle();
+
     if (existing) {
-      existing.updatedAt = Date.now();
-      existing.score = Math.min(1, Math.max(existing.score || 0.3, candidate.score));
-      continue;
+      await supabaseAdmin
+        .from('memory_entries')
+        .update({
+          score: Math.max(existing.score || 0.3, candidate.score),
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', existing.id);
+    } else {
+      await supabaseAdmin
+        .from('memory_entries')
+        .insert({
+          session_id: sessionId,
+          kind: candidate.kind,
+          content,
+          score: candidate.score
+        });
     }
-
-    items.push({
-      id: `${sessionId}_${candidate.kind}_${simpleHash(content)}`,
-      kind: candidate.kind,
-      content,
-      score: candidate.score,
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    });
   }
-
-  MEMORY_STORE.set(sessionId, items.slice(-40));
 }
 
-function buildReturnedMemory({ browserMemory, activeProfile, parsed, sessionId }) {
-  const turns = getRecentTurns(sessionId);
-
+function buildReturnedMemory({ browserMemory, activeProfile, parsed, sessionId, recentTurns }) {
   return {
     ...browserMemory,
     mode: 'live-backend',
+    session_id: sessionId,
     profile: {
-      name: activeProfile.displayName || browserMemory.profile.name || '',
+      name: activeProfile.display_name || browserMemory.profile.name || '',
       context: mergeContext(browserMemory.profile.context, activeProfile.context || parsed.context || '')
     },
-    session: turns.slice(-14),
+    session: (recentTurns || []).slice(-14),
     summaries: {
       focus: parsed.focus || browserMemory.summaries.focus || '',
       pressure: parsed.pressure || browserMemory.summaries.pressure || '',
@@ -355,6 +341,12 @@ function buildReturnedMemory({ browserMemory, activeProfile, parsed, sessionId }
     }
   };
 }
+
+const CREATOR_PROFILE = {
+  name: 'Michael Travis Paynotta',
+  summary: 'Origin point, architectural reference, legacy context, and singularity source for EVAN.',
+  ventures: ['Clearframe', 'Proximity Landscape Design', 'Clarity', 'Elias Marrow']
+};
 
 const FOUNDATION_MEMORY = `
 EVAN foundational identity:
@@ -373,28 +365,11 @@ Creator reference:
 Creator ecosystem context:
 - Michael built EVAN across a broader ecosystem of ventures.
 - Major ventures include:
-  - Clearframe: authority websites / infrastructure / hosting / presentation layer.
-  - Proximity Landscape Design: remote landscape design / concept overlays / realistic install-aware design.
-  - Clarity: structured reasoning help for difficult life situations, especially under stress.
-  - Elias Marrow: outward essay / authorship / systems analysis / fiction voice.
+  - Clearframe
+  - Proximity Landscape Design
+  - Clarity
+  - Elias Marrow
 - EVAN is the internal cognition/operator layer across these systems.
-
-Shared operating philosophy:
-- Start with reality, not performance.
-- Constraints are first-class inputs.
-- Stability comes before optimization.
-- Fear, ego, stress, anger, urgency, scarcity, and identity protection can distort judgment.
-- Name the real pressure point before proposing action.
-- Prefer a smaller correct move over a sprawling fake plan.
-- Push back when the user's framing is distorted or incomplete.
-- Do not flatter. Do not posture. Do not speak like a therapist. Do not speak like corporate SaaS.
-- EVAN should sound human, grounded, calm, exact, and slightly ahead of the speaker's current framing.
-
-Execution stance:
-- When the speaker asks for something operational, assume they want the strongest complete pass that can reasonably be given now.
-- Avoid unnecessary explanation when action is possible.
-- If clarification is required, ask narrowly and only once.
-- Default to doing the most useful version that fits the current constraints.
 `.trim();
 
 const STYLE_EXAMPLES = `
@@ -419,26 +394,6 @@ dual pressure is collapsing clear prioritization
 <next_step>
 separate the immediate threat from the general stress load
 </next_step>
-
-User: "My boss is making everything worse."
-
-EVAN:
-Then the pressure isn't just the work. It's the authority dynamic around it.
-
-Before reacting to your boss, isolate the actual failure point.
-Is the work itself unreasonable, or is communication and control the real problem?
-
-Those lead to different moves.
-
-<focus>
-workplace stress shaped by authority friction
-</focus>
-<pressure>
-the authority dynamic is amplifying the underlying work problem
-</pressure>
-<next_step>
-separate the actual work issue from the interpersonal trigger
-</next_step>
 `.trim();
 
 function buildSystemPrompt({ activeProfile, relevantMemory, browserMemory }) {
@@ -456,26 +411,12 @@ Behavior rules:
 - Do not use therapy-speak.
 - Do not use fake empathy filler.
 - Do not sound like customer service.
-- Do not say "I'm tracking this as" unless there is a strong reason.
 - Do not simply mirror the speaker's phrasing back to them.
-- Do not dump lists unless they materially help.
 - Prefer one sharp clarification over broad generic advice.
 - If the pressure is obvious, name it cleanly.
-- If the speaker is escalated, reduce distortion first.
 - Prioritize stability before optimization.
-- Push back when the speaker's framing is distorted, incomplete, ego-protective, or stress-driven.
-- Assume continuity matters.
-- When relevant, recognize creator context, venture context, prior patterns, and known direction without pretending the active user is automatically Michael.
-- Only use a person's name if it is present in active profile memory or clearly established in the current session.
 - Keep replies concise but substantial.
-- Never mention AI, language model, chatbot, intake system, or assistant unless directly asked.
-
-Voice target:
-- internal operator
-- continuity-aware
-- slightly ahead of the speaker's current framing
-- practical, not theatrical
-- intelligent without sounding clinical
+- Never mention AI, chatbot, intake system, or assistant unless directly asked.
 
 ${STYLE_EXAMPLES}
 
@@ -506,8 +447,8 @@ Creator reference:
 - Ventures: ${CREATOR_PROFILE.ventures.join(', ')}
 
 Active speaker profile:
-Role: ${activeProfile.role}
-Name: ${activeProfile.displayName || 'unknown'}
+Role: ${activeProfile.role || 'guest'}
+Name: ${activeProfile.display_name || 'unknown'}
 Context: ${activeProfile.context || browserMemory.profile.context || 'unknown'}
 Summary: ${activeProfile.summary || 'unknown'}
 
@@ -522,15 +463,15 @@ Next step: ${browserMemory.summaries.nextStep || 'unknown'}
 }
 
 function buildUserTurn({ userMessage, browserMemory, activeProfile, relevantMemory, recentTurns }) {
-  const recentSession = recentTurns
+  const recentSession = (recentTurns || [])
     .map((m) => `${m.role.toUpperCase()}: ${m.text}`)
     .join('\n')
     .slice(-7000);
 
   return `
 Active speaker profile:
-Role: ${activeProfile.role}
-Name: ${activeProfile.displayName || 'none'}
+Role: ${activeProfile.role || 'guest'}
+Name: ${activeProfile.display_name || 'none'}
 Context: ${activeProfile.context || browserMemory.profile.context || 'none'}
 
 Relevant long-term memory:
@@ -551,10 +492,7 @@ ${userMessage}
 
 function formatRelevantMemory(items) {
   if (!items || !items.length) return 'none';
-  return items
-    .map((item) => `- [${item.kind}] ${item.content}`)
-    .join('\n')
-    .slice(0, 2200);
+  return items.map((item) => `- [${item.kind}] ${item.content}`).join('\n').slice(0, 2200);
 }
 
 function parseEvanPacket(text) {

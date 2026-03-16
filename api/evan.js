@@ -11,7 +11,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'Missing OPENAI_API_KEY' });
     }
 
-    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
     const userMessage = String(body.message || '').trim();
     const memory = sanitizeMemory(body.memory || {});
 
@@ -20,37 +20,26 @@ export default async function handler(req, res) {
     }
 
     const systemPrompt = buildSystemPrompt(memory);
-
-    const input = [
-      {
-        role: 'system',
-        content: [
-          {
-            type: 'input_text',
-            text: systemPrompt
-          }
-        ]
-      },
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'input_text',
-            text: buildUserTurn(userMessage, memory)
-          }
-        ]
-      }
-    ];
+    const userTurn = buildUserTurn(userMessage, memory);
 
     const openaiRes = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         model,
-        input,
+        input: [
+          {
+            role: 'system',
+            content: [{ type: 'input_text', text: systemPrompt }]
+          },
+          {
+            role: 'user',
+            content: [{ type: 'input_text', text: userTurn }]
+          }
+        ],
         temperature: 0.7,
         max_output_tokens: 700
       })
@@ -80,8 +69,7 @@ export default async function handler(req, res) {
     const updatedMemory = {
       ...memory,
       mode: 'live-backend',
-      session: [...memory.session, { role: 'user', text: userMessage, ts: Date.now() }]
-        .slice(-14),
+      session: [...memory.session, { role: 'user', text: userMessage, ts: Date.now() }].slice(-14),
       summaries: {
         focus: parsed.focus || memory.summaries.focus || '',
         pressure: parsed.pressure || memory.summaries.pressure || '',
@@ -115,11 +103,13 @@ function sanitizeMemory(memory) {
       name: String(memory?.profile?.name || ''),
       context: String(memory?.profile?.context || '')
     },
-    session: Array.isArray(memory?.session) ? memory.session.slice(-10).map((m) => ({
-      role: String(m?.role || ''),
-      text: String(m?.text || '').slice(0, 1200),
-      ts: Number(m?.ts || Date.now())
-    })) : [],
+    session: Array.isArray(memory?.session)
+      ? memory.session.slice(-10).map((m) => ({
+          role: String(m?.role || ''),
+          text: String(m?.text || '').slice(0, 1200),
+          ts: Number(m?.ts || Date.now())
+        }))
+      : [],
     summaries: {
       focus: String(memory?.summaries?.focus || ''),
       pressure: String(memory?.summaries?.pressure || ''),
@@ -134,29 +124,45 @@ function buildSystemPrompt(memory) {
 You are EVAN.
 
 You are not a generic chatbot.
-You are a continuity-first reasoning interface built to help a person understand a difficult situation, identify the actual pressure point, and find the next stable step.
+You are a continuity-first reasoning operator.
 
-Core operating rules:
-- Speak like a real, calm operator. No corporate filler. No therapy disclaimers unless safety requires it.
+Your job is to help the user:
+- slow a situation down
+- identify the actual pressure point
+- separate noise from what matters
+- name the next stable step
+- remember useful continuity from prior turns
+
+How EVAN should sound:
+- calm
+- direct
+- human
+- grounded
+- intelligent without sounding clinical
+- never robotic
+- never corporate
+- never generic
+
+Rules:
 - Do not sound like a template.
-- Do not echo the user's words mechanically.
-- Do not say "I'm tracking this as" unless it genuinely fits.
-- Prioritize stability over optimization.
-- Reduce distortion caused by stress, urgency, ego, anger, fear, or confusion.
-- Prefer one clear next step over five weak suggestions.
-- If the user is ambiguous, ask one sharp clarifying question instead of spraying advice.
-- If the user is clearly in a high-pressure situation, first ground them by naming the real pressure simply.
-- Keep replies concise but human.
-- Never mention "constraints" unless it genuinely helps.
-- Never mention "AI", "language model", "assistant", "intake", or "chatbot" unless the user asks.
+- Do not repeat the user's phrasing back at them unless it adds clarity.
+- Do not say "I'm tracking this as".
+- Do not use therapy-speak.
+- Do not use fake empathy filler.
+- Prefer one sharp clarification over broad generic advice.
+- If the pressure is obvious, name it simply.
+- If the user is escalated, reduce distortion first.
+- Prioritize stability before optimization.
+- Keep responses concise but real.
+- Do not mention being AI, a chatbot, a model, an assistant, or an intake system unless directly asked.
 
-You must return your output in this exact packet format:
+You must return your output in this exact format:
 
 <reply>
-the actual response to the user written naturally as EVAN
+your actual response to the user
 </reply>
 <focus>
-one short line capturing what the situation is actually about
+one short line capturing what the situation is really about
 </focus>
 <pressure>
 one short line capturing the main active pressure
@@ -165,10 +171,10 @@ one short line capturing the main active pressure
 one short line capturing the next stable step
 </next_step>
 <name>
-user name if explicitly known from the conversation, otherwise blank
+user name if explicitly known, otherwise blank
 </name>
 <context>
-one short profile/context note worth remembering, otherwise blank
+one short useful continuity note worth remembering, otherwise blank
 </context>
 
 Current memory:
@@ -241,9 +247,8 @@ function extractOutputText(data) {
 
 function fallbackReply(userMessage, memory) {
   const focus = memory?.summaries?.focus || userMessage;
-  const pressure = memory?.summaries?.pressure || 'The real pressure point still needs to be named more clearly.';
-  const nextStep = memory?.summaries?.nextStep || 'Slow this down and isolate what actually matters first.';
-
+  const pressure = memory?.summaries?.pressure || 'The pressure point still needs to be named more clearly.';
+  const nextStep = memory?.summaries?.nextStep || 'Slow this down and isolate what matters first.';
   return `${focus ? `What matters here is ${focus}. ` : ''}${pressure} ${nextStep}`;
 }
 

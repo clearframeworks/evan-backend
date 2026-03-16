@@ -19,14 +19,30 @@ export default async function handler(req, res) {
 
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
     const userMessage = String(body.message || '').trim();
-    const memory = sanitizeMemory(body.memory || {});
+    const browserMemory = sanitizeBrowserMemory(body.memory || {});
+    const sessionId = getSessionId(req, body);
 
     if (!userMessage) {
       return res.status(400).json({ error: 'Missing message' });
     }
 
-    const systemPrompt = buildSystemPrompt(memory);
-    const userTurn = buildUserTurn(userMessage, memory);
+    const activeProfile = getOrCreateProfile(sessionId, browserMemory);
+    const relevantMemory = getRelevantMemory(sessionId, userMessage);
+    const recentTurns = getRecentTurns(sessionId);
+
+    const systemPrompt = buildSystemPrompt({
+      activeProfile,
+      relevantMemory,
+      browserMemory
+    });
+
+    const userTurn = buildUserTurn({
+      userMessage,
+      browserMemory,
+      activeProfile,
+      relevantMemory,
+      recentTurns
+    });
 
     const openaiRes = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
@@ -70,30 +86,31 @@ export default async function handler(req, res) {
       });
     }
 
-    const parsed = parseEvanPacket(outputText, memory);
+    const parsed = parseEvanPacket(outputText);
 
-    const updatedMemory = {
-      ...memory,
-      mode: 'live-backend',
-      session: [...memory.session, { role: 'user', text: userMessage, ts: Date.now() }].slice(-14),
-      summaries: {
-        focus: parsed.focus || memory.summaries.focus || '',
-        pressure: parsed.pressure || memory.summaries.pressure || '',
-        nextStep: parsed.nextStep || memory.summaries.nextStep || ''
-      },
-      profile: {
-        ...memory.profile,
-        name: parsed.name || memory.profile.name || '',
-        context: mergeContext(memory.profile.context, parsed.context)
-      }
-    };
+    saveTurn(sessionId, 'user', userMessage);
+    saveTurn(sessionId, 'evan', parsed.reply);
+    updateProfile(sessionId, parsed, browserMemory);
+    updateMemoryStore(sessionId, parsed, userMessage, activeProfile);
 
-    updatedMemory.session.push({ role: 'evan', text: parsed.reply, ts: Date.now() });
-    updatedMemory.session = updatedMemory.session.slice(-14);
+    const updatedProfile = getOrCreateProfile(sessionId, browserMemory);
+    const updatedMemory = buildReturnedMemory({
+      browserMemory,
+      activeProfile: updatedProfile,
+      parsed,
+      sessionId
+    });
 
     return res.status(200).json({
       reply: parsed.reply,
-      memory: updatedMemory
+      memory: updatedMemory,
+      session_id: sessionId,
+      profile: {
+        id: updatedProfile.id,
+        displayName: updatedProfile.displayName || '',
+        role: updatedProfile.role,
+        context: updatedProfile.context || ''
+      }
     });
   } catch (err) {
     return res.status(500).json({
@@ -109,7 +126,23 @@ function setCors(res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
-function sanitizeMemory(memory) {
+const CREATOR_PROFILE = {
+  id: 'creator_michael',
+  name: 'Michael Travis Paynotta',
+  role: 'creator',
+  summary: 'Origin point, architectural reference, legacy context, and singularity source for EVAN.',
+  ventures: ['Clearframe', 'Proximity Landscape Design', 'Clarity', 'Elias Marrow']
+};
+
+const PROFILE_STORE = globalThis.__EVAN_PROFILE_STORE__ || new Map();
+const MEMORY_STORE = globalThis.__EVAN_MEMORY_STORE__ || new Map();
+const TURN_STORE = globalThis.__EVAN_TURN_STORE__ || new Map();
+
+globalThis.__EVAN_PROFILE_STORE__ = PROFILE_STORE;
+globalThis.__EVAN_MEMORY_STORE__ = MEMORY_STORE;
+globalThis.__EVAN_TURN_STORE__ = TURN_STORE;
+
+function sanitizeBrowserMemory(memory) {
   return {
     profile: {
       name: String(memory?.profile?.name || ''),
@@ -128,6 +161,198 @@ function sanitizeMemory(memory) {
       nextStep: String(memory?.summaries?.nextStep || '')
     },
     mode: String(memory?.mode || 'live-backend')
+  };
+}
+
+function getSessionId(req, body) {
+  const explicit = String(body?.session_id || '').trim();
+  if (explicit) return sanitizeId(explicit);
+
+  const headerId = String(req?.headers?.['x-evan-session'] || '').trim();
+  if (headerId) return sanitizeId(headerId);
+
+  const memoryName = String(body?.memory?.profile?.name || '').trim();
+  const memoryContext = String(body?.memory?.profile?.context || '').trim();
+  const sessionSeed = JSON.stringify(body?.memory?.session || []).slice(0, 400);
+  const raw = `${memoryName}|${memoryContext}|${sessionSeed}`;
+
+  if (raw.replace(/[|]/g, '').trim()) {
+    return 'guest_' + simpleHash(raw);
+  }
+
+  return 'guest_' + simpleHash(`${Date.now()}_${Math.random()}`);
+}
+
+function sanitizeId(value) {
+  return String(value).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || ('guest_' + simpleHash(value));
+}
+
+function simpleHash(input) {
+  let hash = 0;
+  const str = String(input);
+  for (let i = 0; i < str.length; i += 1) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+function getOrCreateProfile(sessionId, browserMemory) {
+  if (!PROFILE_STORE.has(sessionId)) {
+    PROFILE_STORE.set(sessionId, {
+      id: sessionId,
+      displayName: String(browserMemory?.profile?.name || '').trim(),
+      role: sessionId.startsWith('creator_') ? 'creator' : 'guest',
+      context: String(browserMemory?.profile?.context || '').trim(),
+      summary: '',
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    });
+  }
+
+  const profile = PROFILE_STORE.get(sessionId);
+
+  if (!profile.displayName && browserMemory?.profile?.name) {
+    profile.displayName = String(browserMemory.profile.name).trim();
+  }
+
+  if (browserMemory?.profile?.context) {
+    profile.context = mergeContext(profile.context, browserMemory.profile.context);
+  }
+
+  profile.updatedAt = Date.now();
+  PROFILE_STORE.set(sessionId, profile);
+  return profile;
+}
+
+function getRelevantMemory(sessionId, userMessage) {
+  const items = MEMORY_STORE.get(sessionId) || [];
+  const lowered = String(userMessage || '').toLowerCase();
+
+  return items
+    .map((item) => {
+      let score = Number(item.score || 0.3);
+      const content = String(item.content || '').toLowerCase();
+      if (lowered && content) {
+        const tokens = lowered.split(/\W+/).filter(Boolean);
+        for (const token of tokens) {
+          if (token.length > 3 && content.includes(token)) score += 0.15;
+        }
+      }
+      return { ...item, _rank: score };
+    })
+    .sort((a, b) => b._rank - a._rank)
+    .slice(0, 8)
+    .map(({ _rank, ...item }) => item);
+}
+
+function getRecentTurns(sessionId) {
+  return (TURN_STORE.get(sessionId) || []).slice(-12);
+}
+
+function saveTurn(sessionId, role, text) {
+  const turns = TURN_STORE.get(sessionId) || [];
+  turns.push({ role, text: String(text || '').slice(0, 2000), ts: Date.now() });
+  TURN_STORE.set(sessionId, turns.slice(-20));
+}
+
+function updateProfile(sessionId, parsed, browserMemory) {
+  const profile = PROFILE_STORE.get(sessionId) || {
+    id: sessionId,
+    displayName: '',
+    role: 'guest',
+    context: '',
+    summary: '',
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+
+  if (parsed.name) {
+    profile.displayName = parsed.name;
+  } else if (!profile.displayName && browserMemory?.profile?.name) {
+    profile.displayName = String(browserMemory.profile.name).trim();
+  }
+
+  profile.context = mergeContext(profile.context, parsed.context || browserMemory?.profile?.context || '');
+  profile.summary = compactSummary([
+    profile.summary,
+    parsed.focus,
+    parsed.pressure,
+    parsed.nextStep
+  ].filter(Boolean).join(' | '));
+  profile.updatedAt = Date.now();
+
+  PROFILE_STORE.set(sessionId, profile);
+}
+
+function updateMemoryStore(sessionId, parsed, userMessage, activeProfile) {
+  const items = MEMORY_STORE.get(sessionId) || [];
+  const candidates = [
+    {
+      kind: 'focus',
+      content: parsed.focus,
+      score: 0.9
+    },
+    {
+      kind: 'pressure',
+      content: parsed.pressure,
+      score: 0.9
+    },
+    {
+      kind: 'next_step',
+      content: parsed.nextStep,
+      score: 0.85
+    },
+    {
+      kind: 'context',
+      content: parsed.context || activeProfile?.context,
+      score: 0.7
+    },
+    {
+      kind: 'user_signal',
+      content: String(userMessage || '').slice(0, 240),
+      score: 0.4
+    }
+  ].filter((item) => item.content && String(item.content).trim());
+
+  for (const candidate of candidates) {
+    const content = compactSummary(candidate.content);
+    const existing = items.find((item) => item.kind === candidate.kind && item.content === content);
+    if (existing) {
+      existing.updatedAt = Date.now();
+      existing.score = Math.min(1, Math.max(existing.score || 0.3, candidate.score));
+      continue;
+    }
+
+    items.push({
+      id: `${sessionId}_${candidate.kind}_${simpleHash(content)}`,
+      kind: candidate.kind,
+      content,
+      score: candidate.score,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    });
+  }
+
+  MEMORY_STORE.set(sessionId, items.slice(-40));
+}
+
+function buildReturnedMemory({ browserMemory, activeProfile, parsed, sessionId }) {
+  const turns = getRecentTurns(sessionId);
+
+  return {
+    ...browserMemory,
+    mode: 'live-backend',
+    profile: {
+      name: activeProfile.displayName || browserMemory.profile.name || '',
+      context: mergeContext(browserMemory.profile.context, activeProfile.context || parsed.context || '')
+    },
+    session: turns.slice(-14),
+    summaries: {
+      focus: parsed.focus || browserMemory.summaries.focus || '',
+      pressure: parsed.pressure || browserMemory.summaries.pressure || '',
+      nextStep: parsed.nextStep || browserMemory.summaries.nextStep || ''
+    }
   };
 }
 
@@ -216,7 +441,7 @@ separate the actual work issue from the interpersonal trigger
 </next_step>
 `.trim();
 
-function buildSystemPrompt(memory) {
+function buildSystemPrompt({ activeProfile, relevantMemory, browserMemory }) {
   return `
 You are EVAN.
 
@@ -241,7 +466,7 @@ Behavior rules:
 - Push back when the speaker's framing is distorted, incomplete, ego-protective, or stress-driven.
 - Assume continuity matters.
 - When relevant, recognize creator context, venture context, prior patterns, and known direction without pretending the active user is automatically Michael.
-- Only use a person's name if it is present in active memory or clearly established in the current session.
+- Only use a person's name if it is present in active profile memory or clearly established in the current session.
 - Keep replies concise but substantial.
 - Never mention AI, language model, chatbot, intake system, or assistant unless directly asked.
 
@@ -269,44 +494,70 @@ one short line capturing the main active pressure
 one short line capturing the next stable step
 </next_step>
 <name>
-speaker name only if clearly established in the current session or active memory, otherwise blank
+speaker name only if clearly established in the current session or active profile memory, otherwise blank
 </name>
 <context>
 one short useful continuity note worth remembering about the current speaker, otherwise blank
 </context>
 
-Active speaker memory:
-Focus: ${memory.summaries.focus || 'unknown'}
-Pressure: ${memory.summaries.pressure || 'unknown'}
-Next step: ${memory.summaries.nextStep || 'unknown'}
-Speaker name: ${memory.profile.name || 'unknown'}
-Speaker context: ${memory.profile.context || 'unknown'}
+Creator reference:
+- ${CREATOR_PROFILE.name}
+- ${CREATOR_PROFILE.summary}
+- Ventures: ${CREATOR_PROFILE.ventures.join(', ')}
+
+Active speaker profile:
+Role: ${activeProfile.role}
+Name: ${activeProfile.displayName || 'unknown'}
+Context: ${activeProfile.context || browserMemory.profile.context || 'unknown'}
+Summary: ${activeProfile.summary || 'unknown'}
+
+Relevant long-term memory:
+${formatRelevantMemory(relevantMemory)}
+
+Browser-carried summaries:
+Focus: ${browserMemory.summaries.focus || 'unknown'}
+Pressure: ${browserMemory.summaries.pressure || 'unknown'}
+Next step: ${browserMemory.summaries.nextStep || 'unknown'}
 `.trim();
 }
 
-function buildUserTurn(userMessage, memory) {
-  const sessionText = (memory.session || [])
+function buildUserTurn({ userMessage, browserMemory, activeProfile, relevantMemory, recentTurns }) {
+  const recentSession = recentTurns
     .map((m) => `${m.role.toUpperCase()}: ${m.text}`)
     .join('\n')
     .slice(-7000);
 
   return `
-Active speaker memory:
-Focus: ${memory.summaries.focus || 'none'}
-Pressure: ${memory.summaries.pressure || 'none'}
-Next step: ${memory.summaries.nextStep || 'none'}
-Speaker name: ${memory.profile.name || 'none'}
-Speaker context: ${memory.profile.context || 'none'}
+Active speaker profile:
+Role: ${activeProfile.role}
+Name: ${activeProfile.displayName || 'none'}
+Context: ${activeProfile.context || browserMemory.profile.context || 'none'}
+
+Relevant long-term memory:
+${formatRelevantMemory(relevantMemory)}
+
+Browser summaries:
+Focus: ${browserMemory.summaries.focus || 'none'}
+Pressure: ${browserMemory.summaries.pressure || 'none'}
+Next step: ${browserMemory.summaries.nextStep || 'none'}
 
 Recent session:
-${sessionText || 'none'}
+${recentSession || 'none'}
 
 Newest user message:
 ${userMessage}
 `.trim();
 }
 
-function parseEvanPacket(text, memory) {
+function formatRelevantMemory(items) {
+  if (!items || !items.length) return 'none';
+  return items
+    .map((item) => `- [${item.kind}] ${item.content}`)
+    .join('\n')
+    .slice(0, 2200);
+}
+
+function parseEvanPacket(text) {
   const reply = readTag(text, 'reply') || fallbackReply();
   const focus = readTag(text, 'focus');
   const pressure = readTag(text, 'pressure');
@@ -355,6 +606,10 @@ function mergeContext(existing, incoming) {
   if (a.includes(b)) return a;
   if (b.includes(a)) return b;
   return `${a} | ${b}`.slice(0, 500);
+}
+
+function compactSummary(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, 500);
 }
 
 function safeJson(raw) {
